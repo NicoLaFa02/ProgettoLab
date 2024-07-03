@@ -1,0 +1,188 @@
+import socket
+import threading
+import json
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+import bcrypt
+import datetime
+
+# Configurazione MongoDB
+client = MongoClient('localhost', 27017)
+db = client['ticketing_system']
+users_collection = db['users']
+events_collection = db['events']
+tickets_collection = db['tickets']
+
+user_lock = threading.Lock()
+log_lock = threading.Lock()
+logged_in_user = None
+
+def log_action(user_id, action):
+    with log_lock:
+        with open("actions.log", "a") as log_file:
+            log_file.write(f"{datetime.datetime.now()} - User ID: {user_id} - Action: {action}\n")
+
+def handle_client(client_socket):
+    global logged_in_user
+    print(f"Client {client_socket} connesso")
+    try:
+        while True:
+            request = client_socket.recv(1024).decode()
+            if not request:
+                break
+
+            request_data = json.loads(request)
+            action = request_data['action']
+
+            if action == 'register':
+                response = register_user(request_data['username'], request_data['password'], request_data['email'])
+            elif action == 'login':
+                response = login_user(request_data['username'], request_data['password'])
+            elif action == 'logout':
+                response = logout_user(request_data['user_id'])
+            elif action == 'list_events':
+                response = list_events()
+            elif action == 'book_ticket':
+                response = book_ticket(request_data['user_id'], request_data['event_id'], request_data['num_tickets'])
+            elif action == 'create_event':
+                response = create_event(request_data['event_name'], request_data['event_date'], request_data['event_location'])
+            elif action == 'update_account':
+                response = update_account(request_data['user_id'], request_data['new_username'], request_data['new_password'], request_data['current_email'])
+            elif action == 'delete_ticket':
+                response = delete_ticket(request_data['user_id'], request_data['ticket_id'])
+            else:
+                response = {'status': 'error', 'message': 'Invalid action'}
+
+            client_socket.send(json.dumps(response).encode())
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        if logged_in_user:
+            user_lock.release()
+            logged_in_user = None
+        client_socket.close()
+
+def register_user(username, password, email):
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+    user = {
+        "username": username,
+        "password": hashed,
+        "email": email,
+        "role": "user"
+    }
+    users_collection.insert_one(user)
+    log_action("N/A", "C Register")  # Registrazione utente (azione create)
+    return {'status': 'success', 'message': 'User registered successfully'}
+
+def login_user(username, password):
+    global logged_in_user
+    if not user_lock.locked():
+        user = users_collection.find_one({"username": username})
+        if user and bcrypt.checkpw(password.encode(), user['password']):
+            log_action(str(user['_id']), "R Login")  # Login utente (azione read)
+            user_lock.acquire()
+            logged_in_user = str(user['_id'])
+            return {'status': 'success', 'user_id': str(user['_id']), 'email': user['email']}
+        else:
+            return {'status': 'error', 'message': 'Invalid username or password'}
+    else:
+        return {'status': 'error', 'message': 'System already in use'}
+
+def logout_user(user_id):
+    global logged_in_user
+    if user_lock.locked() and logged_in_user == user_id:
+        user_lock.release()
+        logged_in_user = None
+        log_action(user_id, "R Logout")
+        return {'status': 'success', 'message': 'User logged out successfully'}
+    else:
+        return {'status': 'error', 'message': 'Logout failed'}
+
+def list_events():
+    events = list(events_collection.find())
+    for event in events:
+        event['_id'] = str(event['_id'])
+    print("Eventi trovati nel database:", events)  # Debug
+    log_action("N/A", "R List Events")  # Elenco degli eventi (azione read)
+    return {'status': 'success', 'events': events}
+
+def book_ticket(user_id, event_id, num_tickets):
+    existing_ticket = tickets_collection.find_one({"user_id": ObjectId(user_id)})
+    if existing_ticket:
+        return {'status': 'error', 'message': 'You already have a ticket booked. Cannot book more than one.'}
+
+    event = events_collection.find_one({"_id": ObjectId(event_id)})
+    if event and event['available_tickets'] >= num_tickets:
+        tickets_collection.insert_one({
+            "user_id": ObjectId(user_id),
+            "event_id": ObjectId(event_id),
+            "number_of_tickets": num_tickets
+        })
+        events_collection.update_one(
+            {"_id": ObjectId(event_id)},
+            {"$inc": {"available_tickets": -num_tickets}}
+        )
+        log_action(user_id, "C Book Ticket")  # Prenotazione biglietto (azione create)
+        return {'status': 'success', 'message': 'Tickets booked successfully'}
+    else:
+        return {'status': 'error', 'message': 'Not enough tickets available'}
+
+def create_event(event_name, event_date, event_location):
+    event = {
+        "name": event_name,
+        "date": event_date,
+        "location": event_location,
+        "available_tickets": 100  # Numero di biglietti disponibili iniziali
+    }
+    events_collection.insert_one(event)
+    log_action("N/A", "C Create Event")  # Creazione evento (azione create)
+    return {'status': 'success', 'message': 'Event created successfully'}
+
+def update_account(user_id, new_username, new_password, current_email):
+    hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt())
+    users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"username": new_username, "password": hashed}}
+    )
+    log_action(user_id, "U Update Account")  # Aggiornamento account (azione update)
+    return {'status': 'success', 'message': 'Account updated successfully'}
+
+def delete_ticket(user_id, ticket_id):
+    ticket = tickets_collection.find_one({"_id": ObjectId(ticket_id), "user_id": ObjectId(user_id)})
+    if ticket:
+        tickets_collection.delete_one({"_id": ObjectId(ticket_id)})
+        events_collection.update_one(
+            {"_id": ObjectId(ticket['event_id'])},
+            {"$inc": {"available_tickets": ticket['number_of_tickets']}}
+        )
+        log_action(user_id, "D Delete Ticket")  # Cancellazione biglietto (azione delete)
+        return {'status': 'success', 'message': 'Ticket deleted successfully'}
+    else:
+        return {'status': 'error', 'message': 'Ticket not found or you do not have permission to delete this ticket'}
+
+def load_initial_events():
+    initial_events = [
+        {"name": "Concerto Rock", "date": "2024-07-15", "location": "Stadio Olimpico", "available_tickets": 150},
+        {"name": "Spettacolo di Magia", "date": "2024-08-10", "location": "Teatro Nazionale", "available_tickets": 200},
+        {"name": "Festival del Cibo", "date": "2024-09-05", "location": "Piazza Centrale", "available_tickets": 300}
+    ]
+    events_collection.insert_many(initial_events)
+    print("Eventi iniziali caricati con successo.")
+
+def main():
+    # Carica eventi iniziali
+    load_initial_events()
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(('127.0.0.1', 9999))
+    server.listen(5)
+    print("Server listening on port 9999")
+
+    while True:
+        client_socket, addr = server.accept()
+        print(f"Accepted connection from {addr}")
+        client_handler = threading.Thread(target=handle_client, args=(client_socket,))
+        client_handler.start()
+
+if __name__ == "__main__":
+    main()
