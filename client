@@ -1,0 +1,149 @@
+import socket
+import json
+from getpass import getpass
+from email_validator import validate_email, EmailNotValidError
+
+def check(email):
+    try:
+        v = validate_email(email)
+        return True
+    except EmailNotValidError as e:
+        print(str(e))
+        return False
+
+def send_request(action, data):
+    request = {'action': action}
+    if data:
+        request.update(data)
+    client_socket.send(json.dumps(request).encode())
+    response = client_socket.recv(1024).decode()
+    return json.loads(response)
+
+def update_account(user_id):
+    new_username = input("Enter new username: ")
+    new_password = getpass("Enter new password: ")
+    response = send_request('update_account', {
+        'user_id': user_id,
+        'new_username': new_username,
+        'new_password': new_password,
+        'current_email': current_email  # Usa l'email corrente
+    })
+    return response
+
+def delete_ticket(user_id):
+    tickets = send_request('list_user_tickets', {'user_id': user_id})
+    for ticket in tickets:
+        print(ticket)
+    ticket_id = input("Enter ticket_ID to delete: ")
+    response = send_request('delete_ticket', {'user_id': user_id, 'ticket_id': ticket_id})
+    return response
+
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_socket.connect(('127.0.0.1', 9999))
+
+user_id = None
+current_email = None  # Aggiungi questa variabile per salvare l'email corrente
+
+while True:
+    print("1. Register")
+    print("2. Login")
+    print("3. Logout")
+    print("4. Update Account")
+    print("5. List Events")
+    print("6. Book Ticket")
+    print("7. Delete Ticket")
+    print("8. Exit")
+    choice = input("Enter choice: ")
+
+    if choice == '1':
+        username = input("Enter username: ")
+        password = getpass("Enter password: ")
+        email = input("Enter email: ")
+        if not check(email):
+            continue
+        response = send_request('register', {'username': username, 'password': password, 'email': email})
+        if response['status'] == 'success':
+            print("Registration successful!")
+        else:
+            print("Registration failed:", response['message'])
+    
+    elif choice == '2':
+        username = input("Enter username: ")
+        password = getpass("Enter password: ")
+        response = send_request('login', {'username': username, 'password': password})
+        if response['status'] == 'success':
+            user_id = response['user_id']
+            current_email = response['email']  # Salva l'email corrente
+            print("Login successful!")
+        else:
+            print("Login failed:", response['message'])
+    
+    elif choice == '3':
+        if user_id is None:
+            print("Devi prima effettuare il login!")
+            continue
+        response = send_request('logout', {'user_id': user_id})
+        if response['status'] == 'success':
+            print("Logout successful!")
+            user_id = None
+            current_email = None
+        else:
+            print("Logout failed:", response['message'])
+    
+    elif choice == '4':
+        if user_id is None:
+            print("Devi prima effettuare il login!")
+            continue
+        response = update_account(user_id)
+        if response['status'] == 'success':
+            print("Account updated successfully!")
+        else:
+            print("Update failed:", response['message'])
+    
+    elif choice == '5':
+        response = send_request('list_events', {})
+        if response['status'] == 'success':
+            print("Eventi disponibili:")
+            for event in response['events']:
+                print(f"ID: {event['_id']}, Name: {event['name']}, Date: {event['date']}, Location: {event['location']}, Tickets: {event['available_tickets']}")
+        else:
+            print("Failed to list events:", response['message'])
+    
+    elif choice == '6':
+        if user_id is None:
+            print("Devi prima effettuare il login!")
+            continue
+        event_id = input("Enter event ID: ")
+        num_tickets = 1  # Limita la prenotazione a un solo biglietto
+        response = send_request('book_ticket', {'user_id': user_id, 'event_id': event_id, 'num_tickets': num_tickets})
+        if response['status'] == 'success':
+            print("Ticket booked successfully!")
+        else:
+            print("Booking failed:", response['message'])
+    
+    elif choice == '7':
+        if user_id is None:
+            print("Devi prima effettuare il login!")
+            continue
+        response = delete_ticket(user_id)
+        if response['status'] == 'success':
+            print("Ticket deleted successfully!")
+        else:
+            print("Delete failed:", response['message'])
+    
+    elif choice == '8':
+        if user_id:
+            response = send_request('logout', {'user_id': user_id})
+            if response['status'] == 'success':
+                print("Logout successful!")
+                user_id = None
+                current_email = None
+            else:
+                print("Logout failed:", response['message'])
+        break
+    
+    else:
+        print("Scelta non valida. Riprova.")
+        continue
+
+client_socket.close()
